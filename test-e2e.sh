@@ -1186,6 +1186,137 @@ post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
 echo
+echo "------- 重定向链（/api/redirect-chain）演算 -------"
+
+echo "== R1. 303 改 GET（HEAD 保留）；301/302 仅 POST→GET；307/308 保留方法 =="
+R=$(post /api/redirect-chain '{"url":"https://a.test/start","method":"POST","steps":[{"status":303,"location":"/s1"},{"status":307,"location":"https://a.test/s2"},{"status":200}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['ok'] is True, d
+h=d['hops']
+assert h[0]['method']=='POST' and h[0]['nextMethod']=='GET', h[0]
+assert h[1]['method']=='GET' and h[1]['nextMethod']=='GET', h[1]
+assert h[2]['method']=='GET' and h[2]['final'] is True and h[2]['nextUrl'] is None, h[2]
+assert h[0]['nextUrl']=='https://a.test/s1' and d['finalUrl']=='https://a.test/s2'
+print('✅ 303 POST→GET，307 保留 GET；相对 Location 基于当前 URL 解析；末跳无 nextUrl')" && PASS=$((PASS+1)) || { echo "❌ 方法改写错误: $R"; FAIL=$((FAIL+1)); }
+
+R=$(post /api/redirect-chain '{"url":"https://a.test/start","method":"HEAD","steps":[{"status":303,"location":"/s1"},{"status":200}]}')
+check "303 保留 HEAD" '"nextMethod":"HEAD"' "$R"
+R=$(post /api/redirect-chain '{"url":"https://a.test/start","method":"PUT","steps":[{"status":302,"location":"/s1"},{"status":301,"location":"/s2"},{"status":308,"location":"/s3"},{"status":200}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert [h['nextMethod'] for h in d['hops'][:3]]==['PUT','PUT','PUT'], d
+print('✅ 302/301/308 对非 POST 方法（PUT）保留不变')" && PASS=$((PASS+1)) || { echo "❌ 非 POST 方法被改写"; FAIL=$((FAIL+1)); }
+
+echo "== R2. 每跳先发 Cookie 头，再按顺序写 Set-Cookie；后续跳带上新 cookie =="
+post /api/reset '{}' >/dev/null
+R=$(post /api/redirect-chain '{"url":"https://shop.example.com/start","method":"GET","steps":[{"status":302,"location":"/next","setCookies":["sid=abc; Path=/; Max-Age=3600","t=2; Path=/"]},{"status":200}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+h1,h2=d['hops']
+assert h1['request']['cookieHeader']=='', h1['request']
+assert [w['action'] for w in h1['writes']]==['stored','stored'], h1['writes']
+assert len(h1['jarAfter'])==2
+assert h2['request']['cookieHeader']=='sid=abc; t=2', h2['request']['cookieHeader']
+assert [i['cookie'] for i in h2['request']['sent']]==['sid=abc','t=2']
+assert len(d['cookies'])==2
+print('✅ 第 1 跳写入两条，第 2 跳 Cookie 头携带；顺序按 Path 长度/创建序号排序')" && PASS=$((PASS+1)) || { echo "❌ 逐跳发送/写入错误: $R"; FAIL=$((FAIL+1)); }
+
+echo "== R3. Set-Cookie 按响应 URL 写默认 Path =="
+R=$(post /api/redirect-chain '{"url":"https://a.test/admin/dashboard","steps":[{"status":200,"setCookies":["x=1"]}]}')
+check "默认 Path=/admin" '"path":"/admin"' "$R"
+
+echo "== R4. 单条 Set-Cookie 语义错误：该跳记 rejected，链继续 =="
+R=$(post /api/redirect-chain '{"url":"https://a.test/","steps":[{"status":200,"setCookies":["notacookie","ok=1; Path=/"]}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+w=d['hops'][0]['writes']
+assert w[0]['action']=='rejected' and w[1]['action']=='stored', w
+assert d['ok'] is True
+print('✅ 非法 Set-Cookie 仅该条拒绝，链继续且好 cookie 入罐')" && PASS=$((PASS+1)) || { echo "❌ 逐跳拒绝语义错误"; FAIL=$((FAIL+1)); }
+
+echo "== R5. 预校验失败 -> 400，罐保持不变 =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://a.test/","setCookie":"keep=1; Path=/"}' >/dev/null
+chain_400() { # desc body
+  local desc="$1"; local body="$2"
+  CODE=$(curl -s -o /tmp/chain400.json -w '%{http_code}' -X POST "$BASE/api/redirect-chain" -H 'Content-Type: application/json' -d "$body")
+  R=$(cat /tmp/chain400.json)
+  if [ "$CODE" = "400" ] && [[ "$R" == *'"ok":false'* ]] && [[ "$R" == *"罐保持不变"* ]]; then
+    echo "✅ $desc -> 400（罐保持不变）"; PASS=$((PASS+1))
+  else echo "❌ $desc 应 400 且提示罐不变，实际 $CODE: $R"; FAIL=$((FAIL+1)); fi
+}
+chain_400 "起始 URL 非法" '{"url":"not-a-url","steps":[{"status":200}]}'
+chain_400 "顶层 URL 非 http(s)" '{"url":"https://a.test/","topUrl":"ftp://x/","steps":[{"status":200}]}'
+chain_400 "steps 为空" '{"url":"https://a.test/","steps":[]}'
+chain_400 "steps 超过 8 个" '{"url":"https://a.test/","steps":[{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":302,"location":"/x"},{"status":200}]}'
+chain_400 "中间跳 200" '{"url":"https://a.test/","steps":[{"status":200},{"status":200}]}'
+chain_400 "末跳不是 200" '{"url":"https://a.test/","steps":[{"status":302,"location":"/x"}]}'
+chain_400 "末跳 200 带 Location" '{"url":"https://a.test/","steps":[{"status":200,"location":"/x"}]}'
+chain_400 "中间跳缺 Location" '{"url":"https://a.test/","steps":[{"status":301},{"status":200}]}'
+chain_400 "非法重定向状态码 300" '{"url":"https://a.test/","steps":[{"status":300,"location":"/x"},{"status":200}]}'
+chain_400 "非法状态码 404" '{"url":"https://a.test/","steps":[{"status":404}]}'
+chain_400 "Location 非 http(s)" '{"url":"https://a.test/","steps":[{"status":302,"location":"ftp://b/x"},{"status":200}]}'
+chain_400 "Location 无法解析" '{"url":"https://a.test/","steps":[{"status":302,"location":"http://[bad"},{"status":200}]}'
+chain_400 "setCookies 非数组" '{"url":"https://a.test/","steps":[{"status":200,"setCookies":"x=y"}]}'
+chain_400 "空 Set-Cookie 字符串" '{"url":"https://a.test/","steps":[{"status":200,"setCookies":[""]}]}'
+J=$(curl -s "$BASE/api/jar")
+check "全部预校验失败后罐仍只有 keep" '"totalCount":1' "$J"
+
+echo "== R6. 协议相对 / 查询串相对 Location 解析 =="
+R=$(post /api/redirect-chain '{"url":"https://a.test/start","steps":[{"status":302,"location":"//b.test/p?x=1"},{"status":301,"location":"?tab=2"},{"status":200}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['hops'][0]['nextUrl']=='https://b.test/p?x=1', d['hops'][0]
+assert d['hops'][1]['nextUrl']=='https://b.test/p?tab=2', d['hops'][1]
+print('✅ //host 继承当前 scheme，相对查询串基于当前路径解析')" && PASS=$((PASS+1)) || { echo "❌ 相对 Location 解析错误"; FAIL=$((FAIL+1)); }
+
+echo "== R7. 固定顶层页面 URL 全程沿用（跨站 SameSite 逐跳判定） =="
+post /api/reset '{}' >/dev/null
+# Domain cookie（.test 含两跳主机 a.test/b.test）才能越过 Domain 匹配走到 SameSite 检查
+post /api/store '{"url":"https://a.test/","setCookie":"ss=1; Domain=a.test; Path=/; SameSite=Strict"}' >/dev/null
+post /api/store '{"url":"https://a.test/","setCookie":"ssx=1; Domain=test; Path=/; SameSite=Strict"}' >/dev/null
+R=$(post /api/redirect-chain '{"url":"https://a.test/start","topUrl":"https://other.org/","method":"GET","topLevelNav":true,"steps":[{"status":302,"location":"https://b.test/x"},{"status":200}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for h in d['hops']:
+    assert h['request']['topSite']=='https://other.org', h
+    assert any(i['name']=='ssx' and i['verdict']=='exclude' and 'Strict' in i['detail'] for i in h['request']['excluded']), h
+    assert h['request']['cookieHeader']=='', h
+print('✅ 两跳顶层站均固定为 other.org，Strict 逐跳排除，跨域重定向不改变顶层上下文')" && PASS=$((PASS+1)) || { echo "❌ 固定顶层 URL 未沿用"; FAIL=$((FAIL+1)); }
+
+echo "== R8. 屏蔽第三方 Cookie：缺顶层 URL 拒绝；跨站写普通 Cookie 逐跳拒绝，Partitioned 入罐 =="
+R=$(post /api/redirect-chain '{"url":"https://tracker.vendor.com/p","blockThirdParty":true,"steps":[{"status":200}]}')
+check "开启屏蔽缺 topUrl -> 400" "必须提供有效的顶层页面 URL" "$R"
+post /api/reset '{}' >/dev/null
+R=$(post /api/redirect-chain '{"url":"https://tracker.vendor.com/p","topUrl":"https://shop.example.com/","blockThirdParty":true,"steps":[{"status":302,"location":"/p2","setCookies":["trk=1; Path=/","ch=1; Path=/; Secure; SameSite=None; Partitioned"]},{"status":200}]}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+w=d['hops'][0]['writes']
+assert w[0]['action']=='rejected' and '拒绝写入普通 Cookie' in w[0]['reason'], w[0]
+assert w[1]['action']=='stored' and w[1]['cookie']['partitionKey']=='https://example.com', w[1]
+assert [c['name'] for c in d['cookies']]==['ch'], d['cookies']
+assert all(h['blockThirdParty'] is True and h['request']['topSite']=='https://example.com' for h in d['hops'])
+print('✅ 链内跨站普通 Cookie 拒绝、Partitioned 按固定顶层 URL 分区入罐')" && PASS=$((PASS+1)) || { echo "❌ 链内第三方屏蔽错误"; FAIL=$((FAIL+1)); }
+
+echo "== R9. 参数类型校验 =="
+for bad in '{"url":123,"steps":[{"status":200}]}' '{"url":"https://a.test/","method":5,"steps":[{"status":200}]}' '{"url":"https://a.test/","topLevelNav":"y","steps":[{"status":200}]}' '{"url":"https://a.test/","blockThirdParty":1,"steps":[{"status":200}]}'; do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/redirect-chain" -H 'Content-Type: application/json' -d "$bad")
+  [ "$CODE" = "400" ] && { echo "✅ 类型非法 $bad -> 400"; PASS=$((PASS+1)); } || { echo "❌ $bad 应 400，实际 $CODE"; FAIL=$((FAIL+1)); }
+done
+R=$(post /api/redirect-chain '{"url":"https://a.test/","steps":[{"status":"200"}]}')
+check "状态码非整数 -> 400" "状态码" "$R"
+
+post /api/reset '{}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

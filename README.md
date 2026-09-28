@@ -36,6 +36,21 @@ Partitioned 分区项仍按既有 Secure 与分区键规则正常入罐；**跨�
 - **网络接口 `/api/store`、`/api/send` 行为不变**：仍可写入、更新、删除并在请求头中
   发送 HttpOnly 项（HttpOnly 只阻挡页面脚本，不阻挡网络栈）。
 
+还有 **🔗 重定向链演算** 面板（对应 `POST /api/redirect-chain`）：输入**起始 URL、起始方法、
+固定顶层页面 URL、顶层导航与第三方屏蔽开关**，以及**最多 8 个响应步骤**（状态码、
+`Location`、按顺序写入的 `Set-Cookie` 列表），一次演算一次跟随重定向的全过程：
+
+- 提交前**先预校验整条链**：起始/顶层 URL 与每跳 `Location`（相对地址基于当前跳 URL 解析）
+  都必须是有效 http(s) 目标；中间跳状态码须为 **301/302/303/307/308** 且带 `Location`；
+  **末跳必须为 200 且无 Location**。任一不满足返回 400，**罐保持不变**。
+- 逐跳执行时**每跳先按现有规则生成 Cookie 头**（📤 发送 / 🚫 排除逐项明细，发送项照常
+  刷新最近访问时间），**再按响应 URL 顺序写入该跳的 Set-Cookie**（逐条展示入罐 / 更新 /
+  删除 / 拒绝，以及该跳结束后的罐）。
+- 方法改写对齐 RFC 9110 / 浏览器语义：**303** 后续一律改为 **GET**（**HEAD 保留**）；
+  **301/302 仅把 POST 改为 GET**，其它方法保留；**307/308 保留方法**。
+  **所有跳沿用同一个固定顶层页面 URL**——same-site 上下文与 Partitioned 分区键不随跳转改变。
+- 结果展示**每跳 URL、方法、Cookie 头、Set-Cookie 写入结果与最终罐**。
+
 内置 **⏱ 演算时钟（可控时间轴）**：服务启动时把当前真实时间固定为演算时钟起点，
 之后**不随真实时间流动**，只能经界面或 `POST /api/clock/advance` 按**正整数秒**推进
 （非法输入被拒绝且时钟与罐均不变）。网络写入/发送、`document.cookie` 读写、罐快照与
@@ -73,7 +88,7 @@ docker compose up --build -d
 
 > **http://localhost:3000**
 
-- Web 界面与全部 API（`/api/store`、`/api/send`、`/api/clock`、`/api/snapshot` 等）都在 **同一端口 localhost:3000** 提供；
+- Web 界面与全部 API（`/api/store`、`/api/send`、`/api/redirect-chain`、`/api/clock`、`/api/snapshot` 等）都在 **同一端口 localhost:3000** 提供；
   - Web 界面：**http://localhost:3000/**
   - API 根路径：**http://localhost:3000/api/...**（如 `GET http://localhost:3000/api/jar`、`GET http://localhost:3000/api/snapshot`）
 - 容器内服务端口：**3000**（由 `docker-compose.yml` 的 `PORT=3000` 环境变量指定）；
@@ -118,13 +133,25 @@ docker compose up --build -d    # 改完代码后重新构建并启动
    - 📤 **发送项**：命中的主机 / Path / Secure / SameSite / 分区键匹配点
    - 🚫 **排除项**：过期、Domain 不匹配、Path 不匹配、Secure 受限、SameSite 拦截、
      **分区键不符（Partitioned）**、**第三方屏蔽（跨站普通 Cookie）**等逐项原因
-3. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、**分区键**、Secure、
+3. **🔗 重定向链演算**（左栏「🔗 重定向链演算」面板，对应 `POST /api/redirect-chain`）：
+   - 填**起始 URL、起始方法、固定顶层页面 URL**（留空 = 与各请求 URL 同站/同分区）、
+     勾选**顶层导航**与**屏蔽第三方 Cookie**（对每一跳都生效）；
+   - 用「+ 添加跳」编排 **1~8 个响应步骤**：每步选**状态码**、填 **Location**
+     （中间跳必填，可相对当前 URL；末跳 200 留空）、在多行框里每行填一条
+     **Set-Cookie**（按顺序写入，可留空）；「填入示例」可一键载入 301→302→303→200 链；
+   - 点击 **演算重定向链**：服务端**先预校验整条链**，失败直接显示 400 原因且**罐不变**；
+     通过后逐跳展示**该跳 URL / 方法 / 状态码**、同站跨站与分区键、**Cookie 头**（可复制）、
+     📤 发送与 🚫 排除明细、📥 每条 Set-Cookie 的入罐/更新/删除/拒绝结果（含容量淘汰清单），
+     以及解析出的**下一跳 URL 与改写后的方法**；底部给出末跳地址与最终罐；
+   - 方法改写：**303 → GET**（HEAD 保留）、**301/302 仅 POST → GET**、**307/308 保留**；
+     所有跳沿用同一个固定顶层页面 URL，跨域/跨站重定向下的 SameSite 与分区行为可逐跳对照。
+4. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、**分区键**、Secure、
    Priority、有效期剩余、创建序号、**最近访问时间**）；点击 **重置** 清空内存罐。
-4. **🎚️ 容量压力模拟**（右栏顶部）：设置**全局容量**与**每个可注册域的容量**（按条目条数，
+5. **🎚️ 容量压力模拟**（右栏顶部）：设置**全局容量**与**每个可注册域的容量**（按条目条数，
    留空 = 不限），点击 **应用容量设置** 立即按新上限执行一次淘汰；之后每次入罐通过校验都会
    自动依次执行域级、全局淘汰。面板中实时显示全局与各域用量（`当前条数/上限`），
    入罐结果区会展示**本次触发的淘汰清单**（过期清理 / 容量淘汰、逐条排序依据）。
-5. **📜 document.cookie 脚本演算**（右栏中部，模拟页面 JS）：
+6. **📜 document.cookie 脚本演算**（右栏中部，模拟页面 JS）：
    - 填**页面 URL**（执行脚本的文档地址）与**顶层页面 URL**（留空 = 同站 / 同分区），
      可勾选**屏蔽第三方 Cookie**（开启后顶层页必填，跨站页面读不到普通 Cookie）；
    - 点击 **读取 document.cookie**：查看脚本读到的字符串（可一键复制）、页面站 / 顶层站、
@@ -136,13 +163,13 @@ docker compose up --build -d    # 改完代码后重新构建并启动
      但**带 `HttpOnly` 的赋值**、以及**覆盖或 `Max-Age<=0` 删除同身份未过期 HttpOnly 项**
      都会被**拒绝**，拒绝时罐内容、时间戳与容量均不变（结果区会明确说明）。
      HttpOnly 项仍可通过第 1 步的网络写入 `/api/store` 改写，也仍会出现在第 2 步的请求头中。
-6. **⏱ 演算时钟**（右栏顶部）：面板显示**当前演算时间**、启动时刻与已推进秒数。
+7. **⏱ 演算时钟**（右栏顶部）：面板显示**当前演算时间**、启动时刻与已推进秒数。
    服务启动时时钟固定，不随真实时间流动；在输入框填**正整数秒**点击 **推进**
    （对应 `POST /api/clock/advance`），罐表格中的剩余有效期 / 过期标灰随即按新时间刷新。
    非法输入（0、负数、非整数、非数字）被拒绝且**时钟与罐均不变**；
    **推进本身不删除条目**，过期项留待下次匹配或容量淘汰处理；
    点击 **重置** 清空罐时，时钟同步回到启动时刻。
-7. **📦 场景快照**（右栏「🫙 当前 Cookie 罐」面板顶部）：
+8. **📦 场景快照**（右栏「🫙 当前 Cookie 罐」面板顶部）：
    - 点击 **⬇ 快照下载**（或 `GET /api/snapshot`）：浏览器保存一个
      `cookie-jar-snapshot-<时间戳>.json` 文件，内含带 `format` / `version` 的完整场景：
      全部**原始 Cookie 条目**（含分区键、创建序号、创建/更新/最近访问时间，过期项也在）、
@@ -378,6 +405,41 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
 **网络接口不受影响**：`/api/store` 仍可写入、覆盖、删除 HttpOnly 项，`/api/send`
 仍会在请求头中发送通过筛选的 HttpOnly 项——HttpOnly 只隔离页面脚本，不隔离网络栈。
 
+### 重定向链演算（`/api/redirect-chain`；左栏「🔗 重定向链演算」面板）
+
+一次提交整条链的输入：**起始 URL、起始方法、固定顶层页面 URL、顶层导航与第三方屏蔽
+开关**，以及 **1~8 个响应步骤**，每步给出模拟响应的 **状态码、Location（可相对）与
+Set-Cookie 列表**。
+
+**预校验（任一不满足返回 400，罐不发生任何改动）**：
+
+- 起始 URL 与固定顶层页面 URL（填写时）必须是有效 http(s) 地址；
+- 开启屏蔽第三方 Cookie 时固定顶层页面 URL 必填；
+- 除最后一步外，每步状态码必须是 **301/302/303/307/308**，且带可解析的 `Location`
+  （相对地址基于**当前跳 URL** 解析，如 `/home`、`?tab=1`、`//host/path`）；
+  解析后的目标必须仍是 http(s)；
+- **末步必须为 200 且不带 Location**（200 出现在中间、或末步是其它状态码都拒绝）。
+
+**逐跳执行**（`hops[]` 中每跳一项）：
+
+1. **先按现有规则生成 Cookie 头**：等价于对该跳请求 URL 调 `/api/send`——顶层页面
+   URL、方法（可能已被上一跳改写）、顶层导航与屏蔽开关逐项参与；`request.sent` /
+   `request.excluded` 给出每条 Cookie 的发送 / 排除原因，发送成功照常刷新最近访问时间；
+2. **再按响应 URL 顺序写入 `setCookies`**：等价于对该跳响应 URL（= 当前请求 URL）逐条
+   调 `/api/store`，沿用同一个固定顶层页面 URL 与第三方屏蔽开关；每条给出
+   入罐 / 更新 / 删除 / 拒绝结果、提示与容量淘汰报告；
+3. 中间跳随后计算下一跳：`nextUrl` 为 Location 解析结果，`nextMethod` 按状态码改写——
+   - **303**：一律改为 **GET**（**HEAD 保留**）；
+   - **301/302**：仅 **POST → GET**（历史表单改写语义；PUT/DELETE 等保留）；
+   - **307/308**：方法保持不变。
+
+**固定顶层页面 URL 全程不变**：即使重定向跨域（如 `login.example.com` →
+`shop.example.com`，甚至跨站），same-site 判定基准与 Partitioned 请求分区键始终是它，
+因此 Strict cookie 是否随跳转发送、跨站响应的普通 Cookie 是否被第三方屏蔽拒绝，都可以
+逐跳对照。响应另外给出 `finalUrl`、每跳 `jarAfter` 与最终的 `cookies`/`capacity`。
+注意单条 `Set-Cookie` 自身的语义错误（如无法解析、`SameSite=None` 未带 Secure）按既有
+规则在该跳记为 `rejected` 并继续后续步骤；只有**预校验**阶段的失败才保证整链零改动。
+
 ### 演算时钟（可控时间轴；`/api/clock`、`/api/clock/advance`）
 
 - **启动即固定**：服务启动时把当前真实时间固定为演算时钟起点，之后时钟**不随真实
@@ -440,6 +502,7 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
 | POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true, "blockThirdParty"?: false }` | 演算 Cookie 头与逐项原因；请求分区键由顶层页面 URL（缺省取请求 URL）计算并以 `partitionKey` 返回，仅键相同的 `Partitioned` 项发送。`blockThirdParty=true` 时 `topUrl` 必填且须有效，跨站请求排除普通 Cookie（不刷新其最近访问时间），分区键匹配的 Partitioned 项仍可发送；响应以 `blockThirdParty` 回显开关状态。**HttpOnly 项照常发送**。发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
 | POST | `/api/script/read` | `{ "url": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 读取演算（页面 JS 视角）**：按既有 过期/分区/第三方屏蔽/Domain/Path/Secure 顺序筛选，**最后再排除 HttpOnly**；**不应用 SameSite、不刷新最近访问时间、不改动罐**。可读项沿用请求头排序（Path 长度降序、创建序号升序），以 `cookieString`（`; ` 拼接）返回，并在 `readable` / `excluded` 中逐项说明原因；上下文字段同 `/api/send`（页面站、顶层站、`partitionKey`、开关回显） |
 | POST | `/api/script/write` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 赋值演算**：复用 `/api/store` 的解析、分区身份与容量逻辑，但**拒绝带 HttpOnly 的赋值**，并**拒绝覆盖或以 `Max-Age<=0` 删除同身份（name、domain、path、分区键）且未过期的 HttpOnly 项**（已过期的不在保护之列）；脚本专属拒绝在改动罐前返回，**罐内容、时间戳与容量不变**。响应结构同 `/api/store`（`action`/`reason`/`jar`/`eviction`） |
+| POST | `/api/redirect-chain` | `{ "url": "...", "method"?: "GET", "topUrl"?: "...", "topLevelNav"?: true, "blockThirdParty"?: false, "steps": [{ "status": 302, "location": "/next", "setCookies": ["a=1; Path=/"] }, { "status": 200, "setCookies": [] }] }` | **重定向链演算（1~8 跳）**：先预校验整条链（起始/顶层 URL 与每跳目标必须是 http(s)；中间跳 `status` ∈ 301/302/303/307/308 且 `location` 可解析——相对地址基于当前跳 URL；末跳必须为 200 且无 Location），失败返回 400 且**罐保持不变**。通过后逐跳**先生成 Cookie 头**（`request` 内含 sent/excluded 明细）**再按顺序写入该响应 URL 的 `setCookies`**（逐条 action/reason/eviction）；303 后改 GET（HEAD 保留）、301/302 仅 POST→GET、307/308 保留方法；所有跳沿用固定 `topUrl`。响应含 `hops[]`（每跳 url/method/status/request/writes/location/nextUrl/nextMethod/jarAfter）、`finalUrl` 与最终 `cookies`/`capacity` |
 | POST | `/api/capacity` | `{ "globalLimit"?: number \| null, "domainLimits"?: { "example.com": 3 } }` | 替换式设置全局 / 每可注册域容量（正整数；`null`/缺省 = 不限），立即执行一轮淘汰并返回报告 |
 | GET | `/api/snapshot` | — | 下载**场景快照**（`snapshot` 字段）：带 `format`/`version` 的 JSON，含全部原始 Cookie 条目（分区键、创建序号、创建/更新/最近访问时间，过期项也在）、容量规则、演算时钟起点与当前值、下一创建序号；响应另附 `cookieCount`、`clock`、`capacity` |
 | POST | `/api/snapshot/import` | 快照对象本身，或 `{ "snapshot": {...} }` | **导入场景快照**：先完整校验结构 / 时间范围 / 条目身份唯一性 / 序号一致性 / 枚举约束（非法 JSON 或体积超 2MB 同样 400），通过后一次性替换罐、容量规则与时钟；失败返回 400 且**旧罐、容量和时钟均不变**。成功响应含 `restoredCount`、`domainLimitCount`、`globalLimit`、`clock`、`capacity`、`jar`（过期项保留）、`snapshot` |
@@ -550,6 +613,25 @@ curl -s -X POST http://localhost:3000/api/script/write \
 curl -s -X POST http://localhost:3000/api/script/write \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://shop.example.com/admin/dashboard","setCookie":"sid=hacked"}'
+
+# 重定向链：POST 起始 → 303（改 GET，HEAD 保留）→ 相对 Location → 末跳 200；
+# 每跳先生成 Cookie 头，再按顺序写入该跳 Set-Cookie；所有跳沿用固定顶层页面 URL
+curl -s -X POST http://localhost:3000/api/redirect-chain \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://blog.example.com/post","method":"POST",
+       "topUrl":"https://portal.example.net/","topLevelNav":true,"blockThirdParty":false,
+       "steps":[
+         {"status":301,"location":"https://blog.example.com/post",
+          "setCookies":["sid=jump1; Path=/; Max-Age=3600"]},
+         {"status":302,"location":"/home","setCookies":[]},
+         {"status":200,"setCookies":["last=1; Path=/; Max-Age=600"]}
+       ]}'
+
+# 预校验失败（末跳不是 200 / 中间跳状态码非法 / Location 非 http(s) / 超过 8 跳 等）
+# -> 400，罐保持不变
+curl -s -X POST http://localhost:3000/api/redirect-chain \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://blog.example.com/","steps":[{"status":302,"location":"ftp://x/y"}]}'
 ```
 
 ---
@@ -563,10 +645,10 @@ curl -s -X POST http://localhost:3000/api/script/write \
 ├── package.json
 ├── tsconfig.json
 ├── src
-│   ├── server.ts           # Express 入口与 API（含容量设置、document.cookie 脚本读写、演算时钟读取/推进、场景快照下载/导入接口）
-│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰/document.cookie 脚本视角/演算时钟/场景快照导出与完整校验导入）
+│   ├── server.ts           # Express 入口与 API（含容量设置、document.cookie 脚本读写、重定向链演算、演算时钟读取/推进、场景快照下载/导入接口）
+│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰/document.cookie 脚本视角/重定向链/演算时钟/场景快照导出与完整校验导入）
 └── public
-    ├── index.html          # 原生前端页面（含顶层 URL 输入、容量压力配置、document.cookie 演算、演算时钟与场景快照下载/导入面板）
+    ├── index.html          # 原生前端页面（含顶层 URL 输入、容量压力配置、document.cookie 演算、重定向链演算、演算时钟与场景快照下载/导入面板）
     ├── styles.css
     └── app.js
 ```

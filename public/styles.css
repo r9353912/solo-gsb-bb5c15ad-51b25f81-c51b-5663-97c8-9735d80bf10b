@@ -500,3 +500,104 @@ select:focus {
   z-index: 100;
 }
 .toast.show { opacity: 1; }
+
+/* ---------- 重定向链面板 ---------- */
+.chain-steps { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 12px; }
+.chain-step {
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg-soft);
+}
+.chain-step-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.chain-hop-no {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 700;
+  border-radius: 10px;
+  padding: 1px 10px;
+  border: 1px solid var(--card-border);
+  color: var(--text-dim);
+}
+.chain-hop-no.redirect { background: var(--amber-bg); color: #f3c168; border-color: rgba(240,160,32,.35); }
+.chain-hop-no.final { background: var(--green-bg); color: var(--green); border-color: rgba(63,185,107,.35); }
+.chain-status-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.chain-status {
+  width: auto;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.chain-location { flex: 1 1 220px; min-width: 0; padding: 7px 9px; font-size: 12px; }
+.chain-cookies {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  outline: none;
+  resize: vertical;
+}
+.chain-cookies:focus {
+  border-color: var(--primary-dim);
+  box-shadow: 0 0 0 3px rgba(240, 160, 32, 0.15);
+}
+.chain-step-hint { margin-top: 5px; font-size: 11.5px; }
+
+/* 重定向链结果 */
+.chain-hop-list { margin-top: 12px; display: flex; flex-direction: column; gap: 14px; }
+.chain-hop {
+  border: 1px solid var(--card-border);
+  border-left: 3px solid var(--primary);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--bg-soft);
+}
+.chain-hop.final { border-left-color: var(--green); }
+.chain-hop-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13.5px;
+}
+.chain-hop-badge {
+  font-weight: 700;
+  font-size: 12px;
+  background: var(--primary);
+  color: #1a1205;
+  border-radius: 10px;
+  padding: 1px 10px;
+}
+.chain-hop-method {
+  color: var(--blue);
+  font-weight: 700;
+}
+.chain-hop-url { word-break: break-all; }
+.chain-write-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.chain-write {
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: var(--card);
+  font-size: 13px;
+}
+.chain-write.stored, .chain-write.updated { border-left: 3px solid var(--green); }
+.chain-write.deleted { border-left: 3px solid var(--primary); }
+.chain-write.rejected { border-left: 3px solid var(--red); }
+.chain-write-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

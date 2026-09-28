@@ -18,6 +18,13 @@
  *                                复用既有解析/分区身份/容量逻辑；拒绝带 HttpOnly 的赋值，
  *                                以及对同身份未过期 HttpOnly 项的覆盖或 Max-Age 删除
  *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）
+ *   POST /api/redirect-chain    { url, method?, topUrl?, topLevelNav?, blockThirdParty?, steps }
+ *                                重定向链演算：最多 8 个响应步骤（status / location / setCookies[]）。
+ *                                先预校验整条链（每跳 http(s) 目标、301/302/303/307/308 跳转、
+ *                                末跳 200 且无 Location、相对 Location 基于当前 URL 解析），
+ *                                失败返回 400 且罐保持不变；通过后逐跳先生成 Cookie 头再按顺序
+ *                                写入 Set-Cookie；303 改 GET（HEAD 保留），301/302 仅 POST→GET，
+ *                                307/308 保留方法；所有跳沿用固定顶层页面 URL。
  *   POST /api/capacity           { globalLimit?, domainLimits? } 设置全局/每可注册域容量并立即执行淘汰
  *   GET  /api/snapshot           下载场景快照（带 format/version：原始 Cookie 条目（含分区键、
  *                                创建序号与创建/最近访问时间）、容量规则、时钟起点与当前值、下一序号）
@@ -199,6 +206,48 @@ app.post('/api/script/write', (req, res) => {
     { blockThirdParty: blockThirdParty === true, fromScript: true },
   );
   res.json({ ...result, capacity: jar.capacity() });
+});
+
+interface RedirectChainBody {
+  url?: unknown;
+  method?: unknown;
+  topUrl?: unknown;
+  topLevelNav?: unknown;
+  blockThirdParty?: unknown;
+  steps?: unknown;
+}
+
+app.post('/api/redirect-chain', (req, res) => {
+  const body = (req.body ?? {}) as RedirectChainBody;
+  // 结构性类型校验（字段类型）在此快速拦截；链本身的完整语义预校验
+  // （状态码 / Location 解析 / 末跳 200 等）由 jar.redirectChain 在改动罐之前完成
+  if (body.url !== undefined && typeof body.url !== 'string') {
+    res.status(400).json({ ok: false, error: '起始 URL（字段 url）必须是字符串；重定向链演算已取消，罐保持不变' });
+    return;
+  }
+  if (body.method !== undefined && typeof body.method !== 'string') {
+    res.status(400).json({ ok: false, error: '起始方法（字段 method）必须是字符串；重定向链演算已取消，罐保持不变' });
+    return;
+  }
+  if (body.topUrl !== undefined && typeof body.topUrl !== 'string') {
+    res.status(400).json({ ok: false, error: '顶层页面 URL（字段 topUrl）必须是字符串；重定向链演算已取消，罐保持不变' });
+    return;
+  }
+  if (body.topLevelNav !== undefined && typeof body.topLevelNav !== 'boolean') {
+    res.status(400).json({ ok: false, error: '是否顶层导航（字段 topLevelNav）必须是布尔值；重定向链演算已取消，罐保持不变' });
+    return;
+  }
+  if (body.blockThirdParty !== undefined && typeof body.blockThirdParty !== 'boolean') {
+    res.status(400).json({ ok: false, error: '屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值；重定向链演算已取消，罐保持不变' });
+    return;
+  }
+  try {
+    const result = jar.redirectChain(body);
+    res.json(result);
+  } catch (err) {
+    // 预校验未通过：罐保持不变
+    res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 interface CapacityBody {
