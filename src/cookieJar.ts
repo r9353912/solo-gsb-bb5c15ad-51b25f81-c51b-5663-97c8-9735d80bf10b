@@ -428,6 +428,88 @@ export interface SendResult {
   excluded: RequestItem[];
 }
 
+/** 重定向状态码：301/302/303/307/308（方法改写规则各有不同） */
+export const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+/** 重定向链最多 8 个响应步骤（含末跳 200） */
+export const MAX_REDIRECT_CHAIN_STEPS = 8;
+
+/** 重定向链中的一个响应步骤（由调用方预先给定，服务不发起真实请求） */
+export interface RedirectChainStepInput {
+  /** HTTP 状态码：非末跳必须是 301/302/303/307/308；末跳必须是 200 */
+  status: number;
+  /** 跳转目标 Location：重定向跳必填（可相对），相对值基于当前请求 URL 解析；末跳必须留空 */
+  location?: string;
+  /** 该响应携带的 Set-Cookie 列表（按给定顺序逐条写入）；每项必须是字符串 */
+  setCookies?: string[];
+}
+
+/** POST /api/redirect-chain 入参（结构校验在 server 层，语义校验在罐内预先完成） */
+export interface RedirectChainInput {
+  /** 起始请求 URL（第 1 跳目标），必须是 http(s) 绝对 URL */
+  startUrl: string;
+  /** 起始请求方法（缺省 GET；大小写不敏感，内部转大写） */
+  method?: string;
+  /** 固定顶层页面 URL：每一跳都沿用；开启屏蔽第三方 Cookie 时必填 */
+  topUrl?: string;
+  /** 是否顶层导航（每一跳沿用，缺省 true） */
+  topLevelNav?: boolean;
+  /** 屏蔽第三方 Cookie 开关（每一跳沿用，缺省 false） */
+  blockThirdParty?: boolean;
+  /** 响应步骤列表（1~8 个）：前 N-1 个为重定向，最后一个为 200 终态 */
+  steps: RedirectChainStepInput[];
+}
+
+/** 单条 Set-Cookie 在链中的写入结果（即 StoreResult 去掉随附全罐快照后的精简视图） */
+export interface RedirectStoreItem {
+  /** 入参的 Set-Cookie 原文 */
+  setCookie: string;
+  action: StoreAction;
+  reason: string;
+  notices: string[];
+  /** 被更新时沿用的首次创建序号 */
+  inheritedIndex?: number;
+  cookie: CookieView | null;
+  /** 本次写入触发的容量压力淘汰报告（无上限时为 null） */
+  eviction: EvictionReport | null;
+}
+
+/** 重定向链中一跳的完整演算记录 */
+export interface RedirectChainHop {
+  /** 从 1 开始的跳序号 */
+  hop: number;
+  /** 本跳请求 URL（绝对 http(s)） */
+  requestUrl: string;
+  /** 本跳实际发送的方法（大写；可能已被前一跳的 301/302/303 改写） */
+  method: string;
+  /** 方法改写说明（来自上一跳的状态码）；首跳为 null */
+  methodNote: string | null;
+  /** 本跳生成的请求 Cookie 头演算（同 /api/send 的完整逐项结果） */
+  send: SendResult;
+  /** 响应状态码 */
+  status: number;
+  /** 响应 Location 原文（已 trim）；末跳为空串 */
+  location: string;
+  /** 解析后的下一跳绝对 URL；末跳为 null */
+  nextUrl: string | null;
+  /** 本响应按顺序逐条写入 Set-Cookie 的结果 */
+  stores: RedirectStoreItem[];
+  /** 本跳全部 Set-Cookie 处理完成后的罐快照 */
+  jarAfter: CookieView[];
+}
+
+/** POST /api/redirect-chain 结果：失败时 ok=false 且 hops 为空（罐保持不变） */
+export interface RedirectChainResult {
+  ok: boolean;
+  error?: string;
+  startUrl: string;
+  /** 规范化后的起始方法（大写） */
+  method: string;
+  topUrl: string;
+  topLevelNav: boolean;
+  blockThirdParty: boolean;
+  hops: RedirectChainHop[];
+}
+
 /** document.cookie 读取演算中的单项（脚本视角） */
 export interface ScriptReadItem {
   index: number;
@@ -1310,6 +1392,186 @@ export class CookieJar {
       cookieHeader,
       sent,
       excluded,
+    };
+  }
+
+  /**
+   * 重定向链演算（POST /api/redirect-chain）：
+   * 按调用方给定的起始 URL、方法、固定顶层页面 URL（与顶层导航 / 第三方屏蔽开关）
+   * 及最多 8 个响应步骤（状态码、Location、Set-Cookie 列表）逐跳演算。
+   *
+   * 每一跳：先用现有 send() 规则按当前 URL/方法生成 Cookie 请求头，
+   * 再按给定顺序把该响应的 Set-Cookie 逐条写入（响应 URL = 当前请求 URL）。
+   *
+   * 方法改写：303 之后一律改 GET（但 HEAD 保留为 HEAD）；301/302 仅把 POST 改 GET；
+   * 307/308 保留方法。顶层页面 URL、顶层导航与第三方屏蔽开关整条链固定沿用。
+   * 相对 Location 基于当前请求 URL 解析（new URL(location, current)），
+   * 解析结果仍必须是 http(s)（mailto:/javascript: 等拒绝）。
+   *
+   * 先对整条链做完整预校验（起始/顶层 URL、每跳目标 URL、状态码与 Location 组合、
+   * Set-Cookie 列表类型）；任一不通过立即返回 ok=false，且不做任何 send 刷新或写入——
+   * 罐保持不变。校验通过后才逐跳执行（send/store 本身不会再失败）。
+   */
+  runRedirectChain(input: RedirectChainInput): RedirectChainResult {
+    const fail = (error: string): RedirectChainResult => ({
+      ok: false,
+      error,
+      startUrl: '',
+      method: '',
+      topUrl: '',
+      topLevelNav: false,
+      blockThirdParty: false,
+      hops: [],
+    });
+
+    const startUrl = input.startUrl.trim();
+    if (hostFromUrl(startUrl) === null) {
+      return fail(`重定向链预校验失败：起始 URL 非法或非 http(s)：${input.startUrl}；罐保持不变`);
+    }
+    const method = (input.method ?? 'GET').trim().toUpperCase() || 'GET';
+    const topRaw = typeof input.topUrl === 'string' ? input.topUrl.trim() : '';
+    const blockThirdParty = input.blockThirdParty === true;
+    if (topRaw === '' || hostFromUrl(topRaw) === null) {
+      return fail(
+        '重定向链预校验失败：必须提供有效的固定顶层页面 URL（http(s)），每一跳都沿用它作为 SameSite/' +
+          `分区键${blockThirdParty ? ' 与第三方屏蔽' : ''}基准；当前${topRaw === '' ? '未填写' : `值非法或非 http(s)：${topRaw}`}；罐保持不变`,
+      );
+    }
+    const topLevelNav = input.topLevelNav ?? true;
+    const steps = input.steps;
+
+    // ---- 预校验：步骤结构 / 状态码与 Location 组合 / 逐跳 URL 解析（不触碰罐）----
+    const resolvedUrls: string[] = [startUrl];
+    let currentUrl = startUrl;
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i];
+      const isLast = i === steps.length - 1;
+      const status = step.status;
+      const location = typeof step.location === 'string' ? step.location.trim() : '';
+
+      if (isLast) {
+        if (status !== 200) {
+          return fail(`重定向链预校验失败：末跳（第 ${i + 1} 步）必须是 200 且无需 Location，当前状态码为 ${status}；罐保持不变`);
+        }
+        if (location !== '') {
+          return fail(`重定向链预校验失败：末跳（第 ${i + 1} 步）为 200，不能携带 Location（收到：${location}）；罐保持不变`);
+        }
+      } else {
+        if (!REDIRECT_STATUSES.has(status)) {
+          return fail(
+            `重定向链预校验失败：第 ${i + 1} 步（非末跳）状态码必须是 301/302/303/307/308 之一，` +
+            `当前为 ${status}；罐保持不变`,
+          );
+        }
+        if (location === '') {
+          return fail(`重定向链预校验失败：第 ${i + 1} 步为 ${status} 跳转，必须提供 Location；罐保持不变`);
+        }
+        let next: URL;
+        try {
+          next = new URL(location, currentUrl);
+        } catch {
+          return fail(`重定向链预校验失败：第 ${i + 1} 步的 Location 无法基于当前 URL 解析：Location="${location}"，当前 URL="${currentUrl}"；罐保持不变`);
+        }
+        if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+          return fail(
+            `重定向链预校验失败：第 ${i + 1} 步 Location 解析后的目标必须是 http(s)，` +
+            `当前解析为 ${next.href}（协议 ${next.protocol}）；罐保持不变`,
+          );
+        }
+        if (!next.hostname) {
+          return fail(`重定向链预校验失败：第 ${i + 1} 步 Location 解析后的目标缺少主机：${next.href}；罐保持不变`);
+        }
+        currentUrl = next.href;
+        resolvedUrls.push(currentUrl);
+      }
+      const setCookies = step.setCookies;
+      if (setCookies !== undefined) {
+        if (!Array.isArray(setCookies) || setCookies.some((c) => typeof c !== 'string')) {
+          return fail(`重定向链预校验失败：第 ${i + 1} 步的 Set-Cookie 列表必须是字符串数组（可省略或为空）；罐保持不变`);
+        }
+      }
+    }
+
+    // ---- 预校验通过：逐跳执行（先 send 生成头，再按顺序写入 Set-Cookie）----
+    const hops: RedirectChainHop[] = [];
+    let currentMethod = method;
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i];
+      const requestUrl = resolvedUrls[i];
+      const prevStatus = i === 0 ? null : steps[i - 1].status;
+      const prevMethod = i === 0 ? null : hops[i - 1].method;
+      let methodNote: string | null = null;
+      if (prevStatus !== null && prevMethod !== null) {
+        if (prevStatus === 303) {
+          methodNote =
+            prevMethod === 'HEAD'
+              ? '上一跳为 303 See Other：后续方法按 GET 改写，但 HEAD 请求保留为 HEAD（本跳仍为 HEAD）'
+              : `上一跳为 303 See Other：方法 ${prevMethod} 一律改写为 GET（HEAD 除外，HEAD 保留）`;
+        } else if (prevStatus === 301 || prevStatus === 302) {
+          methodNote =
+            prevMethod === 'POST' && currentMethod === 'GET'
+              ? `上一跳为 ${prevStatus}：POST 被改写为 GET（历史表单回退语义；307/308 才严格保留方法）`
+              : `上一跳为 ${prevStatus}：仅 POST 改写为 GET，上跳方法 ${prevMethod} 保持不变`;
+        } else {
+          methodNote = `上一跳为 ${prevStatus}：严格保留请求方法与请求体语义，本跳仍为 ${currentMethod}`;
+        }
+      }
+
+      const sendResult = this.send(requestUrl, {
+        topUrl: topRaw,
+        method: currentMethod,
+        topLevelNav,
+        blockThirdParty,
+      });
+
+      const location = typeof step.location === 'string' ? step.location.trim() : '';
+      const rawSetCookies = step.setCookies ?? [];
+      const stores: RedirectStoreItem[] = rawSetCookies.map((setCookie) => {
+        const r = this.store(requestUrl, setCookie, topRaw, { blockThirdParty });
+        const item: RedirectStoreItem = {
+          setCookie,
+          action: r.action,
+          reason: r.reason,
+          notices: r.notices,
+          cookie: r.cookie,
+          eviction: r.eviction,
+        };
+        if (r.inheritedIndex !== undefined) item.inheritedIndex = r.inheritedIndex;
+        return item;
+      });
+
+      hops.push({
+        hop: i + 1,
+        requestUrl,
+        method: currentMethod,
+        methodNote,
+        send: sendResult,
+        status: step.status,
+        location,
+        nextUrl: i === steps.length - 1 ? null : resolvedUrls[i + 1],
+        stores,
+        jarAfter: this.list(),
+      });
+
+      // ---- 为下一跳改写方法（末跳无下一跳，无需计算）----
+      if (i < steps.length - 1) {
+        if (step.status === 303) {
+          if (currentMethod !== 'HEAD') currentMethod = 'GET';
+        } else if ((step.status === 301 || step.status === 302) && currentMethod === 'POST') {
+          currentMethod = 'GET';
+        }
+        // 307/308：保留方法
+      }
+    }
+
+    return {
+      ok: true,
+      startUrl,
+      method,
+      topUrl: topRaw,
+      topLevelNav,
+      blockThirdParty,
+      hops,
     };
   }
 

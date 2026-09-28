@@ -466,6 +466,64 @@ select:focus {
 .badge.pr-medium { background: var(--blue-bg); color: var(--blue); }
 .badge.pr-low { background: rgba(154,163,181,.18); color: var(--text-dim); }
 
+/* ---------- 重定向链 ---------- */
+.chain-steps-head { margin-bottom: 8px; }
+.chain-steps { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.chain-step {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(154,163,181,.05);
+}
+.chain-step-head { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+.chain-step-head input[type="text"] { padding: 7px 9px; font-size: 12px; }
+.chain-cookie-row input[type="text"] { padding: 7px 9px; font-size: 12px; }
+.chain-step-no { font-weight: 600; font-size: 13px; flex-shrink: 0; color: var(--text-dim); }
+.chain-step-head select { flex: 0 0 84px; }
+.chain-step-head .chain-location { flex: 1 1 0; min-width: 0; }
+.chain-step-head .chain-location:disabled { opacity: .5; }
+.chain-cookies-wrap { margin-top: 8px; }
+.chain-cookie-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.chain-cookie-arrow {
+  flex-shrink: 0; font-size: 10.5px; color: var(--text-faint);
+  border: 1px solid var(--card-border); border-radius: 6px; padding: 2px 6px;
+}
+.chain-cookie-row .chain-cookie { flex: 1 1 0; min-width: 0; }
+.chain-cookies-wrap > .btn { margin-top: 8px; }
+
+.chain-hops { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.chain-hop {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: rgba(154,163,181,.04);
+  overflow: hidden;
+}
+.chain-hop-summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  list-style: none;
+}
+.chain-hop-summary::-webkit-details-marker { display: none; }
+.chain-hop-summary::before { content: '▸'; color: var(--text-faint); font-size: 11px; }
+.chain-hop[open] .chain-hop-summary::before { content: '▾'; }
+.chain-hop-url { font-size: 12px; word-break: break-all; }
+.chain-hop-body { padding: 4px 12px 12px; border-top: 1px solid var(--card-border); }
+.chain-method-note {
+  margin: 6px 0;
+  font-size: 12.5px;
+  color: #f3c168;
+  background: var(--amber-bg);
+  border: 1px solid rgba(240,160,32,.25);
+  border-radius: 8px;
+  padding: 5px 10px;
+}
+.chain-hop-body .header-block { margin: 8px 0; }
+.chain-hop-body .eviction-box { margin-top: 8px; }
+
 /* ---------- 底部规则 ---------- */
 .rules-note {
   padding-bottom: 40px;

@@ -11,6 +11,15 @@
  *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
+ *   POST /api/redirect-chain     { startUrl, method?, topUrl, topLevelNav?, blockThirdParty?,
+ *                                  steps: [{ status, location?, setCookies?[] }] }（最多 8 步）
+ *                                演算整条重定向链：每跳先按现有规则生成 Cookie 头，再按响应 URL
+ *                                顺序写入该跳的 Set-Cookie 列表；303 之后改 GET（HEAD 保留），
+ *                                301/302 仅 POST 改 GET，307/308 保留方法；相对 Location 基于
+ *                                当前 URL 解析；顶层页面 URL / 顶层导航 / 第三方屏蔽整条链沿用。
+ *                                先完整预校验（起始/顶层 URL、每跳 http(s) 目标、状态码与 Location
+ *                                组合、Set-Cookie 列表类型），失败返回 400 且罐保持不变。
+ *                                末跳必须为 200 且无 Location。
  *   POST /api/script/read        { url, topUrl?, blockThirdParty? } 演算页面脚本读取 document.cookie：
  *                                按既有 过期/分区/第三方屏蔽/Domain/Path/Secure 筛选，再排除 HttpOnly；
  *                                不应用 SameSite，不刷新最近访问时间，沿用请求头排序并逐项说明原因
@@ -142,6 +151,104 @@ app.post('/api/send', (req, res) => {
   });
   // 发送成功的条目会刷新最近访问时间，故把最新罐内容与用量一并返回
   res.json({ ...result, capacity: jar.capacity(), cookies: jar.list() });
+});
+
+interface RedirectChainBody {
+  startUrl?: unknown;
+  method?: unknown;
+  topUrl?: unknown;
+  topLevelNav?: unknown;
+  blockThirdParty?: unknown;
+  steps?: unknown;
+}
+
+interface RawStep {
+  status: unknown;
+  location?: unknown;
+  setCookies?: unknown;
+}
+
+app.post('/api/redirect-chain', (req, res) => {
+  const body = (req.body ?? {}) as RedirectChainBody;
+
+  // ---- 结构校验（类型层面的预校验在 server 层；URL/状态码/Location 语义校验在罐内，全部先于任何罐改动）----
+  if (typeof body.startUrl !== 'string' || body.startUrl.trim() === '') {
+    res.status(400).json({ ok: false, error: '缺少起始 URL（字段 startUrl）；罐保持不变' });
+    return;
+  }
+  if (body.method !== undefined && typeof body.method !== 'string') {
+    res.status(400).json({ ok: false, error: '请求方法（字段 method）必须是字符串；罐保持不变' });
+    return;
+  }
+  if (typeof body.topUrl !== 'string' || body.topUrl.trim() === '') {
+    res.status(400).json({ ok: false, error: '缺少固定顶层页面 URL（字段 topUrl，http(s)）：重定向链每一跳都沿用它；罐保持不变' });
+    return;
+  }
+  if (body.topLevelNav !== undefined && typeof body.topLevelNav !== 'boolean') {
+    res.status(400).json({ ok: false, error: '是否顶层导航（字段 topLevelNav）必须是布尔值；罐保持不变' });
+    return;
+  }
+  if (body.blockThirdParty !== undefined && typeof body.blockThirdParty !== 'boolean') {
+    res.status(400).json({ ok: false, error: '屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值；罐保持不变' });
+    return;
+  }
+  if (!Array.isArray(body.steps) || body.steps.length === 0) {
+    res.status(400).json({ ok: false, error: '缺少响应步骤（字段 steps 必须是非空数组）；罐保持不变' });
+    return;
+  }
+  if (body.steps.length > 8) {
+    res.status(400).json({ ok: false, error: `响应步骤最多 8 个（当前 ${body.steps.length} 个）；罐保持不变` });
+    return;
+  }
+
+  const steps = [];
+  for (let i = 0; i < body.steps.length; i += 1) {
+    const raw = body.steps[i] as Partial<RawStep> | null;
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      res.status(400).json({ ok: false, error: `第 ${i + 1} 步必须是对象（含 status，可选 location / setCookies）；罐保持不变` });
+      return;
+    }
+    // 状态码：数字或数字字符串都接受（必须是整数）
+    const statusN = typeof raw.status === 'string' ? Number(raw.status.trim()) : raw.status;
+    if (typeof statusN !== 'number' || !Number.isInteger(statusN) || statusN < 100 || statusN > 599) {
+      res.status(400).json({ ok: false, error: `第 ${i + 1} 步状态码（字段 status）必须是 100~599 的整数；罐保持不变` });
+      return;
+    }
+    if (raw.location !== undefined && typeof raw.location !== 'string') {
+      res.status(400).json({ ok: false, error: `第 ${i + 1} 步 Location 必须是字符串（可相对，留空表示无）；罐保持不变` });
+      return;
+    }
+    if (raw.setCookies !== undefined && !Array.isArray(raw.setCookies)) {
+      res.status(400).json({ ok: false, error: `第 ${i + 1} 步 setCookies 必须是字符串数组；罐保持不变` });
+      return;
+    }
+    const step: { status: number; location?: string; setCookies?: string[] } = { status: statusN };
+    if (raw.location !== undefined) step.location = raw.location;
+    if (raw.setCookies !== undefined) {
+      if ((raw.setCookies as unknown[]).some((c) => typeof c !== 'string')) {
+        res.status(400).json({ ok: false, error: `第 ${i + 1} 步 setCookies 数组的每一项都必须是字符串；罐保持不变` });
+        return;
+      }
+      step.setCookies = raw.setCookies as string[];
+    }
+    steps.push(step);
+  }
+
+  // 语义预校验（URL / 状态码组合 / 每跳目标）全部在罐内完成：失败不做任何 send 刷新或写入
+  const result = jar.runRedirectChain({
+    startUrl: body.startUrl.trim(),
+    method: typeof body.method === 'string' && body.method.trim() !== '' ? body.method.trim() : undefined,
+    topUrl: body.topUrl.trim(),
+    topLevelNav: body.topLevelNav,
+    blockThirdParty: body.blockThirdParty === true,
+    steps,
+  });
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
+  // 链执行中 send 会刷新最近访问时间、store 会改动罐，附最新全罐与用量
+  res.json({ ...result, cookies: jar.list(), capacity: jar.capacity() });
 });
 
 interface ScriptReadBody {

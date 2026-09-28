@@ -20,6 +20,17 @@ const els = {
   sendBtn: $('#send-btn'),
   sendResult: $('#send-result'),
 
+  chainStartUrl: $('#chain-start-url'),
+  chainMethod: $('#chain-method'),
+  chainTopnav: $('#chain-topnav'),
+  chainTopUrl: $('#chain-top-url'),
+  chainBlock3p: $('#chain-block-3p'),
+  chainSteps: $('#chain-steps'),
+  chainAddStep: $('#chain-add-step'),
+  chainRun: $('#chain-run'),
+  chainDemo: $('#chain-demo'),
+  chainResult: $('#chain-result'),
+
   resetBtn: $('#reset-btn'),
   jarCount: $('#jar-count-num'),
   jarWrap: $('#jar-table-wrap'),
@@ -289,6 +300,7 @@ els.snapshotFile.addEventListener('change', async () => {
     // 状态已整体替换，收起其它演算结果，避免与恢复后的场景错位
     els.storeResult.classList.add('hidden');
     els.sendResult.classList.add('hidden');
+    els.chainResult.classList.add('hidden');
     els.capResult.classList.add('hidden');
     els.scriptReadResult.classList.add('hidden');
     els.scriptWriteResult.classList.add('hidden');
@@ -597,6 +609,262 @@ function renderSendResult(data) {
   if (copyBtn) copyBtn.addEventListener('click', () => copyText(data.cookieHeader));
 }
 
+/* ---------- 重定向链演算 ---------- */
+
+const CHAIN_STATUS_OPTIONS = [301, 302, 303, 307, 308, 200];
+
+/** 新增一个响应步骤行（重定向默认 302，末步手动选 200） */
+function addChainStep(status = 302, location = '', setCookies = []) {
+  const idx = els.chainSteps.children.length + 1;
+  const row = document.createElement('div');
+  row.className = 'chain-step';
+  row.innerHTML = `
+    <div class="chain-step-head">
+      <span class="chain-step-no">第 ${idx} 步</span>
+      <select class="chain-status">
+        ${CHAIN_STATUS_OPTIONS.map((s) => `<option value="${s}"${s === status ? ' selected' : ''}>${s}</option>`).join('')}
+      </select>
+      <input class="chain-location" type="text" spellcheck="false" autocomplete="off"
+        placeholder="Location（重定向必填，可相对，如 /dashboard；200 留空）" value="${escapeHtml(location)}" />
+      <button class="btn ghost tiny chain-del" type="button" title="删除该步骤">✕</button>
+    </div>
+    <div class="chain-cookies-wrap">
+      <div class="chain-cookies"></div>
+      <button class="btn ghost tiny chain-add-cookie" type="button">+ 添加 Set-Cookie</button>
+    </div>`;
+
+  const statusSel = row.querySelector('.chain-status');
+  const locInput = row.querySelector('.chain-location');
+  const cookiesBox = row.querySelector('.chain-cookies');
+
+  /** 状态码联动：200 末态不需要 Location；其余为跳转 */
+  function syncStatus() {
+    const is200 = statusSel.value === '200';
+    locInput.disabled = is200;
+    locInput.placeholder = is200 ? '末跳 200：无需 Location（已禁用）' : 'Location（重定向必填，可相对，如 /dashboard）';
+  }
+  statusSel.addEventListener('change', syncStatus);
+
+  function addCookieRow(value = '') {
+    const line = document.createElement('div');
+    line.className = 'chain-cookie-row';
+    line.innerHTML = `
+      <span class="chain-cookie-arrow">Set-Cookie</span>
+      <input class="chain-cookie" type="text" spellcheck="false" autocomplete="off"
+        placeholder="如：sid=abc; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600" value="${escapeHtml(value)}" />
+      <button class="btn ghost tiny chain-cookie-del" type="button" title="删除该 Set-Cookie">✕</button>`;
+    line.querySelector('.chain-cookie-del').addEventListener('click', () => line.remove());
+    cookiesBox.appendChild(line);
+    return line;
+  }
+
+  setCookies.forEach((v) => addCookieRow(v));
+  row.querySelector('.chain-add-cookie').addEventListener('click', () => addCookieRow());
+  row.querySelector('.chain-del').addEventListener('click', () => {
+    row.remove();
+    renumberChainSteps();
+  });
+
+  els.chainSteps.appendChild(row);
+  syncStatus();
+  return row;
+}
+
+function renumberChainSteps() {
+  [...els.chainSteps.children].forEach((row, i) => {
+    row.querySelector('.chain-step-no').textContent = `第 ${i + 1} 步`;
+  });
+}
+
+function collectChainSteps() {
+  return [...els.chainSteps.children].map((row) => {
+    const status = Number(row.querySelector('.chain-status').value);
+    const location = row.querySelector('.chain-location').value.trim();
+    const setCookies = [...row.querySelectorAll('.chain-cookie')]
+      .map((input) => input.value.trim())
+      .filter((v) => v !== '');
+    const step = { status };
+    if (location !== '') step.location = location;
+    if (setCookies.length) step.setCookies = setCookies;
+    return step;
+  });
+}
+
+const STORE_TAG_CLS = {
+  stored: 'send', updated: 'send', deleted: 'evict', rejected: 'exclude',
+};
+const STORE_TAG_TEXT = {
+  stored: '入罐', updated: '更新', deleted: '删除', rejected: '拒绝',
+};
+
+function chainStoreHtml(s) {
+  const tag = STORE_TAG_CLS[s.action] || 'exclude';
+  const text = STORE_TAG_TEXT[s.action] || s.action;
+  return `
+    <div class="item ${s.action === 'rejected' ? 'excluded' : 'sent'}">
+      <div class="item-top">
+        <span class="tag ${tag}">${text}</span>
+        <span class="item-cookie">${escapeHtml(s.setCookie)}</span>
+      </div>
+      <div class="item-detail">${escapeHtml(s.reason)}</div>
+      ${noticesHtml(s.notices)}
+      ${evictionHtml(s.eviction)}
+    </div>`;
+}
+
+function chainHopHtml(h, total) {
+  const isLast = h.hop === total;
+  const statusCls = isLast ? 'ss-same' : 'ss-cross';
+  const arrow = isLast
+    ? `<span class="dim">终态，无下一跳</span>`
+    : `<span class="dim">→ 下一跳 <code>${escapeHtml(h.nextUrl)}</code></span>`;
+  const methodNote = h.methodNote ? `<div class="chain-method-note">🔀 ${escapeHtml(h.methodNote)}</div>` : '';
+
+  // 复用单跳发送结果的逐项渲染（发送 / 排除），上下文精简为关键 meta
+  const sentHtml = h.send.sent.length
+    ? `<div class="group-title">📤 发送项（${h.send.sent.length}）</div>
+       <div class="item-list">${h.send.sent.map(itemHtml).join('')}</div>`
+    : '<div class="group-title">📤 发送项<span class="count">（0）</span></div>';
+  const excludedHtml = h.send.excluded.length
+    ? `<div class="group-title">🚫 排除项（${h.send.excluded.length}）</div>
+       <div class="item-list">${h.send.excluded.map(itemHtml).join('')}</div>`
+    : '';
+  const headerVal = h.send.cookieHeader
+    ? escapeHtml(h.send.cookieHeader)
+    : '<span class="dim">（空：没有可发送的 cookie）</span>';
+
+  const storesHtml = h.stores.length
+    ? `<div class="group-title">📥 本跳 Set-Cookie 写入结果（${h.stores.length}，按响应顺序逐条处理）</div>
+       <div class="item-list">${h.stores.map(chainStoreHtml).join('')}</div>`
+    : '';
+
+  const siteBadge = h.send.sameSiteContext
+    ? '<span class="badge ss-same">同站</span>'
+    : '<span class="badge ss-cross">跨站</span>';
+
+  return `
+    <details class="chain-hop" ${isLast ? ' open' : ''}>
+      <summary class="chain-hop-summary">
+        <span class="badge ${statusCls}">${h.status}</span>
+        <span class="badge ss-lax">${escapeHtml(h.method)}</span>
+        <code class="chain-hop-url">${escapeHtml(h.requestUrl)}</code>
+        ${siteBadge}
+        <span class="dim">Cookie ${h.send.cookieHeader ? h.send.sent.length : 0} 项 · Set-Cookie ${h.stores.length} 条</span>
+      </summary>
+      <div class="chain-hop-body">
+        <div class="meta-line">
+          ${isLast ? '' : `Location: <code>${escapeHtml(h.location)}</code> · `}${arrow}
+        </div>
+        ${methodNote}
+        <div class="meta-line dim">
+          请求站 <code>${escapeHtml(h.send.requestSite)}</code> vs 顶层站 <code>${escapeHtml(h.send.topSite)}</code>
+          · 路径 <code>${escapeHtml(h.send.path)}</code>
+          · ${h.send.secureRequest ? 'https' : 'http'}
+          · ${h.send.topLevelNav ? '顶层导航' : '非顶层导航'}
+          · 屏蔽第三方 Cookie：${h.send.blockThirdParty ? '开' : '关'}
+          · 分区键 <code>${escapeHtml(h.send.partitionKey)}</code>
+        </div>
+        <div class="header-block">
+          <div class="header-line ${h.send.cookieHeader ? '' : 'empty'}">
+            <span class="hname">Cookie:</span>
+            <span class="hval">${headerVal}</span>
+          </div>
+        </div>
+        ${sentHtml}
+        ${excludedHtml}
+        ${storesHtml}
+      </div>
+    </details>`;
+}
+
+function renderChainResult(data) {
+  els.chainResult.classList.remove('hidden');
+  if (!data.ok) {
+    els.chainResult.innerHTML = `
+      <div class="banner bad">
+        <span class="banner-title">⛔ 重定向链未执行</span>${escapeHtml(data.error || '参数有误')}
+      </div>`;
+    return;
+  }
+  const total = data.hops.length;
+  const hopsHtml = data.hops.map((h) => chainHopHtml(h, total)).join('');
+  els.chainResult.innerHTML = `
+    <div class="banner ok">
+      <span class="banner-title">✅ 重定向链演算完成（${total} 跳）</span>
+      起始 <code>${escapeHtml(data.method)}</code> <code>${escapeHtml(data.startUrl)}</code>
+      → 末跳 200；顶层页面 URL 全程固定为 <code>${escapeHtml(data.topUrl)}</code>
+    </div>
+    <div class="chain-hops">${hopsHtml}</div>`;
+}
+
+els.chainAddStep.addEventListener('click', () => {
+  addChainStep(200, '', []);
+});
+
+els.chainRun.addEventListener('click', async () => {
+  const startUrl = els.chainStartUrl.value.trim();
+  const topUrl = els.chainTopUrl.value.trim();
+  if (!startUrl) {
+    renderChainResult({ ok: false, error: '请先填写起始 URL' });
+    return;
+  }
+  if (!topUrl) {
+    renderChainResult({ ok: false, error: '请先填写固定顶层页面 URL（重定向链每一跳都沿用它）' });
+    return;
+  }
+  if (!els.chainSteps.children.length) {
+    renderChainResult({ ok: false, error: '请至少添加一个响应步骤（末跳 200）' });
+    return;
+  }
+  const steps = collectChainSteps();
+  // 前端做一层轻校验，错误信息与服务端预校验保持一致
+  if (steps[steps.length - 1].status !== 200) {
+    renderChainResult({ ok: false, error: `末跳（第 ${steps.length} 步）必须是 200 且无需 Location` });
+    return;
+  }
+  for (let i = 0; i < steps.length - 1; i += 1) {
+    if (![301, 302, 303, 307, 308].includes(steps[i].status)) {
+      renderChainResult({ ok: false, error: `第 ${i + 1} 步（非末跳）状态码必须是 301/302/303/307/308 之一` });
+      return;
+    }
+    if (!steps[i].location) {
+      renderChainResult({ ok: false, error: `第 ${i + 1} 步为 ${steps[i].status} 跳转，必须填写 Location` });
+      return;
+    }
+  }
+  els.chainRun.disabled = true;
+  try {
+    const data = await postJSON('/api/redirect-chain', {
+      startUrl,
+      method: els.chainMethod.value,
+      topUrl,
+      topLevelNav: els.chainTopnav.checked,
+      blockThirdParty: els.chainBlock3p.checked,
+      steps,
+    });
+    renderChainResult(data);
+    // 链中的 send 刷新访问时间、store 改动罐，同步右侧罐表与容量用量
+    if (data.cookies) renderJar(data.cookies);
+    if (data.capacity) renderCapacityUsage(data.capacity);
+  } catch (err) {
+    renderChainResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    els.chainRun.disabled = false;
+  }
+});
+
+els.chainDemo.addEventListener('click', () => {
+  els.chainStartUrl.value = 'https://login.example.com/signin';
+  els.chainMethod.value = 'POST';
+  els.chainTopnav.checked = true;
+  els.chainTopUrl.value = 'https://shop.example.com/home';
+  els.chainBlock3p.checked = false;
+  els.chainSteps.innerHTML = '';
+  addChainStep(303, '/dashboard', ['sid=abc123; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600']);
+  addChainStep(302, 'https://app.example.com/welcome', ['track=1; Domain=example.com; Path=/; Secure; SameSite=None']);
+  addChainStep(200, '', ['ui=ready; Path=/; Secure']);
+});
+
 /* ---------- 事件 ---------- */
 
 els.storeBtn.addEventListener('click', async () => {
@@ -670,6 +938,7 @@ els.resetBtn.addEventListener('click', async () => {
     if (data.clock) renderClock(data.clock);
     els.storeResult.classList.add('hidden');
     els.sendResult.classList.add('hidden');
+    els.chainResult.classList.add('hidden');
     els.capResult.classList.add('hidden');
     els.scriptReadResult.classList.add('hidden');
     els.scriptWriteResult.classList.add('hidden');
@@ -923,6 +1192,14 @@ els.sendUrl.addEventListener('keydown', (e) => {
 els.sendTopUrl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') els.sendBtn.click();
 });
+els.chainStartUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.chainRun.click();
+});
+els.chainTopUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.chainRun.click();
+});
 
 /* 初始加载 */
+addChainStep(302, '', []);
+addChainStep(200, '', []);
 refreshJar().catch((err) => console.error(err));

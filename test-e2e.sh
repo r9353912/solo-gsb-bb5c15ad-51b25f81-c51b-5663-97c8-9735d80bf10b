@@ -1182,6 +1182,125 @@ R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/js
   -d "{\"snapshot\":$(python3 -c "import json;print(json.dumps(json.load(open('$SNAP_FILE'))['snapshot']))")}")
 check "包裹形式 {snapshot} 导入成功" '"ok":true' "$R"
 
+echo
+echo "------- 重定向链 /api/redirect-chain -------"
+
+post /api/reset '{}' >/dev/null
+
+echo "== RC1. 基本链：POST -> 303 改 GET（相对 Location）-> 302 跨主机 -> 200 =="
+R=$(post /api/redirect-chain '{
+  "startUrl":"https://login.example.com/signin","method":"POST",
+  "topUrl":"https://shop.example.com/home",
+  "steps":[
+    {"status":303,"location":"/dashboard","setCookies":["sid=abc; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600"]},
+    {"status":302,"location":"https://app.example.com/welcome","setCookies":["t=1; Domain=example.com; Path=/; Secure; SameSite=None"]},
+    {"status":200,"setCookies":["fin=x; Path=/; Secure"]}
+  ]}')
+check "链执行成功" '"ok":true' "$R"
+check "3 跳" '"hop":3' "$R"
+HM1=$(echo "$R" | python3 -c "import sys,json;h=json.load(sys.stdin)['hops'];print(h[0]['method'])")
+HM2=$(echo "$R" | python3 -c "import sys,json;h=json.load(sys.stdin)['hops'];print(h[1]['method'])")
+[ "$HM1" = "POST" ] && [ "$HM2" = "GET" ] \
+  && { echo "✅ hop1=POST，hop2=GET（303 改写）"; PASS=$((PASS+1)); } \
+  || { echo "❌ 方法改写错误：$HM1/$HM2"; FAIL=$((FAIL+1)); }
+check "相对 Location 解析" '"nextUrl":"https://login.example.com/dashboard"' "$R"
+HDR2=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][1]['send']['cookieHeader'])")
+[ "$HDR2" = "sid=abc" ] && { echo "✅ hop2 携带 hop1 写入的 Cookie：$HDR2"; PASS=$((PASS+1)); } \
+  || { echo "❌ hop2 Cookie 头异常：$HDR2"; FAIL=$((FAIL+1)); }
+check "303 改写说明" "303 See Other" "$R"
+check "末跳 200" '"status":200' "$R"
+check "末跳无下一跳" '"nextUrl":null' "$R"
+check "最终罐含 3 条" '"index":3' "$R"
+
+echo "== RC2. 301 POST->GET；307 保留方法（GET 不被再改写） =="
+post /api/reset '{}' >/dev/null
+R=$(post /api/redirect-chain '{
+  "startUrl":"https://a.example/form","method":"POST","topUrl":"https://a.example/",
+  "steps":[{"status":301,"location":"/r1"},{"status":307,"location":"/r2"},{"status":200}]}')
+check "链成功" '"ok":true' "$R"
+M1=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][0]['method'])")
+M2=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][1]['method'])")
+M3=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][2]['method'])")
+[ "$M1" = "POST" ] && [ "$M2" = "GET" ] && [ "$M3" = "GET" ] \
+  && { echo "✅ 301 把 POST 改 GET，307 保持 GET（$M1/$M2/$M3）"; PASS=$((PASS+1)); } \
+  || { echo "❌ 方法改写错误：$M1/$M2/$M3"; FAIL=$((FAIL+1)); }
+
+echo "== RC3. 303 对 HEAD 保留 HEAD =="
+R=$(post /api/redirect-chain '{
+  "startUrl":"https://a.example/h","method":"HEAD","topUrl":"https://a.example/",
+  "steps":[{"status":303,"location":"/r"},{"status":308,"location":"/r2"},{"status":200}]}')
+H2=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][1]['method'])")
+[ "$H2" = "HEAD" ] && { echo "✅ HEAD 经 303 保留"; PASS=$((PASS+1)); } \
+  || { echo "❌ HEAD 应保留，实际 $H2"; FAIL=$((FAIL+1)); }
+
+echo "== RC4. 预校验失败：罐保持不变 =="
+post /api/reset '{}' >/dev/null
+BEFORE=$(curl -s "$BASE/api/jar")
+rc_expect_400() { # desc body
+  local code
+  code=$(curl -s -o /tmp/rc_resp.json -w '%{http_code}' -X POST "$BASE/api/redirect-chain" \
+    -H 'Content-Type: application/json' -d "$2")
+  if [ "$code" = "400" ] && grep -q '"ok":false' /tmp/rc_resp.json && grep -q '罐保持不变' /tmp/rc_resp.json; then
+    echo "✅ $1 -> 400"; PASS=$((PASS+1));
+  else echo "❌ $1 应 400，实际 $code：$(cat /tmp/rc_resp.json)"; FAIL=$((FAIL+1)); fi
+}
+rc_expect_400 "末跳不是 200" '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[{"status":302,"location":"/x"},{"status":301,"location":"/y"}]}'
+rc_expect_400 "200 带 Location" '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[{"status":302,"location":"/x"},{"status":200,"location":"/y"}]}'
+rc_expect_400 "中间 200" '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[{"status":200},{"status":200}]}'
+rc_expect_400 "跳转缺 Location" '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[{"status":307},{"status":200}]}'
+rc_expect_400 "非 http(s) Location" '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[{"status":302,"location":"mailto:x@y.com"},{"status":200}]}'
+rc_expect_400 "起始 URL 非法" '{"startUrl":"not-a-url","topUrl":"https://a.com/","steps":[{"status":200}]}'
+rc_expect_400 "缺 topUrl" '{"startUrl":"https://a.com/","steps":[{"status":200}]}'
+rc_expect_400 "setCookies 非字符串数组" '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[{"status":200,"setCookies":[1,2]}]}'
+rc_expect_400 "9 步超限" "$(python3 -c "import json;print(json.dumps({'startUrl':'https://a.com/','topUrl':'https://a.com/','steps':[{'status':302,'location':'/x'}]*8+[{'status':200}]}))")"
+AFTER=$(curl -s "$BASE/api/jar")
+[ "$BEFORE" = "$AFTER" ] && { echo "✅ 全部预校验失败后罐保持不变"; PASS=$((PASS+1)); } \
+  || { echo "❌ 预校验失败改动了罐"; FAIL=$((FAIL+1)); }
+
+echo "== RC5. 结构错误（server 层）也 400 =="
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/redirect-chain" \
+  -H 'Content-Type: application/json' -d '{"startUrl":"https://a.com/","topUrl":"https://a.com/","steps":[]}')
+[ "$code" = "400" ] && { echo "✅ 空 steps -> 400"; PASS=$((PASS+1)); } \
+  || { echo "❌ 空 steps 应 400，实际 $code"; FAIL=$((FAIL+1)); }
+
+echo "== RC6. 屏蔽第三方 + Partitioned 沿链沿用同一顶层 URL =="
+post /api/reset '{}' >/dev/null
+# 第 1 跳在跨站 tracker 响应：普通 Cookie 被拒、Partitioned 入罐；
+# 302 跳回同站 shop（200 终态）-> 同站上下文下两个主机域不同，tracker 项均不发送。
+# 为验证「跨站请求只发分区键匹配的 Partitioned 项」，终态落在 tracker 主机。
+R=$(post /api/redirect-chain '{
+  "startUrl":"https://tracker.vendor.com/pixel","topUrl":"https://shop.example.com/home",
+  "blockThirdParty":true,
+  "steps":[
+    {"status":302,"location":"https://tracker.vendor.com/landing",
+     "setCookies":["ch=1; Path=/; Secure; SameSite=None; Partitioned","trk=1; Path=/"]},
+    {"status":200}]}')
+check "链成功" '"ok":true' "$R"
+check "跨站普通 Cookie 拒绝写入" '"action":"rejected"' "$R"
+check "分区 cookie 正常入罐" '"action":"stored"' "$R"
+# 末跳在跨站上下文（tracker ≠ 顶层 shop）：普通 cookie 被第三方屏蔽排除，
+# 分区键匹配的 Partitioned 项仍发送
+LAST_HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][-1]['send']['cookieHeader'])")
+[ "$LAST_HDR" = "ch=1" ] && { echo "✅ 末跳仅发送分区键匹配的 Partitioned 项：$LAST_HDR"; PASS=$((PASS+1)); } \
+  || { echo "❌ 末跳 Cookie 头异常：$LAST_HDR"; FAIL=$((FAIL+1)); }
+# trk 在 hop1 即被第三方屏蔽拒绝，从未入罐：最终罐只剩分区 cookie ch=1
+JAR_NAMES=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print(','.join(sorted(c['name'] for c in json.load(sys.stdin)['cookies'])))")
+[ "$JAR_NAMES" = "ch" ] && { echo "✅ 跨站普通 Cookie 未入罐，最终罐仅 $JAR_NAMES"; PASS=$((PASS+1)); } \
+  || { echo "❌ 最终罐条目异常：$JAR_NAMES"; FAIL=$((FAIL+1)); }
+
+# 罐中已存在的跨站普通 Cookie（如经 /api/store 先写入）在链请求中被排除、
+# 分区键匹配的 Partitioned 项仍发送
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://tracker.vendor.com/","setCookie":"old=1; Path=/; Secure; SameSite=None"}' >/dev/null
+R=$(post /api/redirect-chain '{
+  "startUrl":"https://tracker.vendor.com/start","topUrl":"https://shop.example.com/home",
+  "blockThirdParty":true,"steps":[{"status":200}]}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['hops'][0]['send']['cookieHeader'])")
+EXC=$(echo "$R" | python3 -c "import sys,json;print('|'.join(i['detail'] for i in json.load(sys.stdin)['hops'][0]['send']['excluded']))")
+[ "$HDR" = "" ] && echo "$EXC" | grep -q '屏蔽第三方 Cookie' \
+  && { echo "✅ 链中跨站请求排除既有普通 Cookie（$EXC 节选）"; PASS=$((PASS+1)); } \
+  || { echo "❌ 既有普通 Cookie 应被屏蔽：HDR=$HDR EXC=$EXC"; FAIL=$((FAIL+1)); }
+
 post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
